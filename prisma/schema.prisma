@@ -1,6 +1,3 @@
-// This is your Prisma schema file,
-// learn more about it in the docs: https://pris.ly/d/prisma-schema
-
 generator client {
   provider = "prisma-client-js"
 }
@@ -8,28 +5,6 @@ generator client {
 datasource db {
   provider = "postgresql"
   url      = env("DATABASE_URL")
-}
-
-model User {
-  id            String    @id @default(cuid())
-  email         String    @unique
-  name          String?
-  image         String?
-  emailVerified DateTime?
-  createdAt     DateTime  @default(now())
-  updatedAt     DateTime  @updatedAt
-
-  // Subscription fields
-  stripeCustomerId       String?   @unique
-  stripeSubscriptionId   String?   @unique
-  stripePriceId          String?
-  stripeCurrentPeriodEnd DateTime?
-
-  // Relations
-  accounts      Account[]
-  sessions      Session[]
-  trackedProducts TrackedProduct[]
-  priceAlerts   PriceAlert[]
 }
 
 model Account {
@@ -59,6 +34,21 @@ model Session {
   user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
 }
 
+model User {
+  id            String    @id @default(cuid())
+  name          String?
+  email         String?   @unique
+  emailVerified DateTime?
+  image         String?
+  accounts      Account[]
+  sessions      Session[]
+  products      Product[]
+  isPremium     Boolean   @default(false)
+  stripeCustomerId String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+}
+
 model VerificationToken {
   identifier String
   token      String   @unique
@@ -67,55 +57,30 @@ model VerificationToken {
   @@unique([identifier, token])
 }
 
-model TrackedProduct {
-  id          String   @id @default(cuid())
-  url         String
-  name        String
-  imageUrl    String?
-  currentPrice Float
-  currency    String   @default("USD")
-  store       String
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
-
-  userId      String
-  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-
+model Product {
+  id           String       @id @default(cuid())
+  url          String
+  name         String
+  currentPrice Float?
+  targetPrice  Float
+  imageUrl     String?
+  userId       String
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
   priceHistory PriceHistory[]
-  priceAlerts  PriceAlert[]
+  isActive     Boolean      @default(true)
+  lastChecked  DateTime?
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
 
   @@index([userId])
-  @@index([url])
 }
 
 model PriceHistory {
   id        String   @id @default(cuid())
+  productId String
+  product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
   price     Float
-  currency  String   @default("USD")
-  createdAt DateTime @default(now())
-
-  productId String
-  product   TrackedProduct @relation(fields: [productId], references: [id], onDelete: Cascade)
+  checkedAt DateTime @default(now())
 
   @@index([productId])
-  @@index([createdAt])
-}
-
-model PriceAlert {
-  id          String   @id @default(cuid())
-  targetPrice Float
-  isActive    Boolean  @default(true)
-  triggeredAt DateTime?
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
-
-  userId    String
-  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-
-  productId String
-  product   TrackedProduct @relation(fields: [productId], references: [id], onDelete: Cascade)
-
-  @@index([userId])
-  @@index([productId])
-  @@index([isActive])
 }
