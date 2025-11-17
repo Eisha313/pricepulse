@@ -1,65 +1,85 @@
+'use client';
+
 import useSWR from 'swr';
 
-interface PriceHistoryEntry {
+interface PricePoint {
   id: string;
   price: number;
   checkedAt: string;
 }
 
-interface UsePriceHistoryOptions {
-  productId: string;
-  days?: number;
+interface UsePriceHistoryResult {
+  priceHistory: PricePoint[];
+  isLoading: boolean;
+  error: Error | null;
+  minPrice: number | null;
+  maxPrice: number | null;
+  averagePrice: number | null;
+  priceChange: { value: number; percentage: number } | null;
 }
 
 const fetcher = async (url: string) => {
   const res = await fetch(url);
   if (!res.ok) {
-    const error = await res.json();
-    throw new Error(error.message || 'Failed to fetch price history');
+    const error = new Error('Failed to fetch price history');
+    throw error;
   }
   return res.json();
 };
 
-export function usePriceHistory({ productId, days = 30 }: UsePriceHistoryOptions) {
-  const { data, error, isLoading, mutate } = useSWR<PriceHistoryEntry[]>(
-    productId ? `/api/products/${productId}/history?days=${days}` : null,
+export function usePriceHistory(productId: string | null): UsePriceHistoryResult {
+  const { data, error, isLoading } = useSWR<PricePoint[]>(
+    productId ? `/api/products/${productId}/price-history` : null,
     fetcher,
     {
       revalidateOnFocus: false,
-      dedupingInterval: 60000, // Cache for 1 minute
+      dedupingInterval: 60000, // 1 minute
     }
   );
 
+  const priceHistory = data || [];
+
+  // Calculate statistics with null safety
+  let minPrice: number | null = null;
+  let maxPrice: number | null = null;
+  let averagePrice: number | null = null;
+  let priceChange: { value: number; percentage: number } | null = null;
+
+  if (priceHistory.length > 0) {
+    const prices = priceHistory
+      .map(p => p.price)
+      .filter((price): price is number => 
+        typeof price === 'number' && !isNaN(price) && price > 0
+      );
+
+    if (prices.length > 0) {
+      minPrice = Math.min(...prices);
+      maxPrice = Math.max(...prices);
+      averagePrice = Math.round((prices.reduce((a, b) => a + b, 0) / prices.length) * 100) / 100;
+
+      if (prices.length >= 2) {
+        const oldestPrice = prices[0];
+        const newestPrice = prices[prices.length - 1];
+        const changeValue = newestPrice - oldestPrice;
+        const changePercentage = oldestPrice > 0 
+          ? Math.round((changeValue / oldestPrice) * 10000) / 100
+          : 0;
+        
+        priceChange = {
+          value: Math.round(changeValue * 100) / 100,
+          percentage: changePercentage,
+        };
+      }
+    }
+  }
+
   return {
-    history: data || [],
+    priceHistory,
     isLoading,
-    isError: !!error,
-    error,
-    refresh: mutate,
-  };
-}
-
-export function usePriceStats(productId: string) {
-  const { history, isLoading, isError } = usePriceHistory({ productId, days: 90 });
-
-  const stats = {
-    currentPrice: history[history.length - 1]?.price || 0,
-    lowestPrice: Math.min(...history.map((h) => h.price)) || 0,
-    highestPrice: Math.max(...history.map((h) => h.price)) || 0,
-    averagePrice: history.length
-      ? history.reduce((sum, h) => sum + h.price, 0) / history.length
-      : 0,
-    priceChange: history.length >= 2
-      ? history[history.length - 1].price - history[0].price
-      : 0,
-    priceChangePercent: history.length >= 2
-      ? ((history[history.length - 1].price - history[0].price) / history[0].price) * 100
-      : 0,
-  };
-
-  return {
-    stats,
-    isLoading,
-    isError,
+    error: error || null,
+    minPrice,
+    maxPrice,
+    averagePrice,
+    priceChange,
   };
 }
