@@ -1,108 +1,108 @@
-import { NextRequest, NextResponse } from 'next/server';
+import { NextRequest } from 'next/server';
 import { getServerSession } from 'next-auth';
+import { prisma } from '@/lib/db';
 import { authOptions } from '@/lib/auth';
-import { db } from '@/lib/db';
+import {
+  successResponse,
+  unauthorizedResponse,
+  badRequestResponse,
+} from '@/lib/apiResponse';
+import { withErrorHandler, ValidationError } from '@/lib/apiErrorHandler';
 
-const FREE_PRODUCT_LIMIT = 3;
+export const GET = withErrorHandler(async () => {
+  const session = await getServerSession(authOptions);
 
-export async function GET() {
-  try {
-    const session = await getServerSession(authOptions);
-
-    if (!session?.user?.email) {
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-    }
-
-    const user = await db.user.findUnique({
-      where: { email: session.user.email },
-      include: {
-        products: {
-          include: {
-            priceHistory: {
-              orderBy: { checkedAt: 'desc' },
-              take: 30,
-            },
-          },
-          orderBy: { createdAt: 'desc' },
-        },
-      },
-    });
-
-    if (!user) {
-      return NextResponse.json({ error: 'User not found' }, { status: 404 });
-    }
-
-    return NextResponse.json({
-      products: user.products,
-      isPremium: user.isPremium,
-      productCount: user.products.length,
-      productLimit: user.isPremium ? null : FREE_PRODUCT_LIMIT,
-    });
-  } catch (error) {
-    console.error('Error fetching products:', error);
-    return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
+  if (!session?.user?.id) {
+    return unauthorizedResponse();
   }
-}
 
-export async function POST(request: NextRequest) {
-  try {
-    const session = await getServerSession(authOptions);
-
-    if (!session?.user?.email) {
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-    }
-
-    const user = await db.user.findUnique({
-      where: { email: session.user.email },
-      include: { products: true },
-    });
-
-    if (!user) {
-      return NextResponse.json({ error: 'User not found' }, { status: 404 });
-    }
-
-    // Check product limit for free users
-    if (!user.isPremium && user.products.length >= FREE_PRODUCT_LIMIT) {
-      return NextResponse.json(
-        { error: 'Product limit reached. Upgrade to Premium for unlimited tracking.' },
-        { status: 403 }
-      );
-    }
-
-    const body = await request.json();
-    const { url, name, targetPrice, currentPrice, imageUrl } = body;
-
-    if (!url || !name || targetPrice === undefined) {
-      return NextResponse.json(
-        { error: 'Missing required fields: url, name, targetPrice' },
-        { status: 400 }
-      );
-    }
-
-    const product = await db.product.create({
-      data: {
-        url,
-        name,
-        targetPrice: parseFloat(targetPrice),
-        currentPrice: currentPrice ? parseFloat(currentPrice) : null,
-        imageUrl,
-        userId: user.id,
-      },
-    });
-
-    // Create initial price history entry if current price is provided
-    if (currentPrice) {
-      await db.priceHistory.create({
-        data: {
-          productId: product.id,
-          price: parseFloat(currentPrice),
+  const products = await prisma.product.findMany({
+    where: {
+      userId: session.user.id,
+    },
+    include: {
+      alerts: true,
+      priceHistory: {
+        orderBy: {
+          createdAt: 'desc',
         },
-      });
-    }
+        take: 1,
+      },
+    },
+    orderBy: {
+      createdAt: 'desc',
+    },
+  });
 
-    return NextResponse.json(product, { status: 201 });
-  } catch (error) {
-    console.error('Error creating product:', error);
-    return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
+  return successResponse(products);
+});
+
+export const POST = withErrorHandler(async (request: NextRequest) => {
+  const session = await getServerSession(authOptions);
+
+  if (!session?.user?.id) {
+    return unauthorizedResponse();
+  }
+
+  const body = await request.json();
+  const { url, name, targetPrice } = body;
+
+  // Validate required fields
+  const errors: Record<string, string[]> = {};
+  
+  if (!url || typeof url !== 'string') {
+    errors.url = ['URL is required'];
+  } else if (!isValidUrl(url)) {
+    errors.url = ['Invalid URL format'];
+  }
+
+  if (!name || typeof name !== 'string') {
+    errors.name = ['Product name is required'];
+  }
+
+  if (targetPrice !== undefined && (typeof targetPrice !== 'number' || targetPrice < 0)) {
+    errors.targetPrice = ['Target price must be a positive number'];
+  }
+
+  if (Object.keys(errors).length > 0) {
+    throw new ValidationError('Validation failed', errors);
+  }
+
+  // Check product limit for non-premium users
+  const user = await prisma.user.findUnique({
+    where: { id: session.user.id },
+    select: { isPremium: true },
+  });
+
+  if (!user?.isPremium) {
+    const productCount = await prisma.product.count({
+      where: { userId: session.user.id },
+    });
+
+    if (productCount >= 5) {
+      return badRequestResponse(
+        'Free users can only track up to 5 products. Upgrade to premium for unlimited tracking.'
+      );
+    }
+  }
+
+  const product = await prisma.product.create({
+    data: {
+      url,
+      name,
+      targetPrice,
+      userId: session.user.id,
+    },
+  });
+
+  return successResponse(product, 'Product created successfully', 201);
+});
+
+function isValidUrl(string: string): boolean {
+  try {
+    new URL(string);
+    return true;
+  } catch {
+    return false;
   }
 }
