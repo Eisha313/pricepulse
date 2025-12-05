@@ -1,108 +1,73 @@
 import { NextRequest } from 'next/server';
-import { getServerSession } from 'next-auth';
 import { prisma } from '@/lib/db';
-import { authOptions } from '@/lib/auth';
+import { apiSuccess, apiError, ApiErrorType } from '@/lib/apiResponse';
+import { withErrorHandler } from '@/lib/apiErrorHandler';
+import { productSchema } from '@/lib/validations/product';
 import {
-  successResponse,
-  unauthorizedResponse,
-  badRequestResponse,
-} from '@/lib/apiResponse';
-import { withErrorHandler, ValidationError } from '@/lib/apiErrorHandler';
+  requireAuth,
+  isAuthError,
+  parseJsonBody,
+  isParseError,
+  getPaginationParams,
+  buildPaginationMeta,
+} from '@/lib/apiHelpers';
+import { checkSubscriptionLimits } from '@/lib/subscription';
 
-export const GET = withErrorHandler(async () => {
-  const session = await getServerSession(authOptions);
+export const GET = withErrorHandler(async (request: NextRequest) => {
+  const auth = await requireAuth();
+  if (isAuthError(auth)) return auth;
 
-  if (!session?.user?.id) {
-    return unauthorizedResponse();
-  }
+  const pagination = getPaginationParams(request, { limit: 20 });
 
-  const products = await prisma.product.findMany({
-    where: {
-      userId: session.user.id,
-    },
-    include: {
-      alerts: true,
-      priceHistory: {
-        orderBy: {
-          createdAt: 'desc',
+  const [products, total] = await Promise.all([
+    prisma.product.findMany({
+      where: { userId: auth.userId },
+      include: {
+        alerts: true,
+        priceHistory: {
+          orderBy: { createdAt: 'desc' },
+          take: 1,
         },
-        take: 1,
       },
-    },
-    orderBy: {
-      createdAt: 'desc',
-    },
-  });
+      orderBy: { createdAt: 'desc' },
+      skip: pagination.skip,
+      take: pagination.limit,
+    }),
+    prisma.product.count({
+      where: { userId: auth.userId },
+    }),
+  ]);
 
-  return successResponse(products);
+  return apiSuccess({
+    products,
+    pagination: buildPaginationMeta(total, pagination),
+  });
 });
 
 export const POST = withErrorHandler(async (request: NextRequest) => {
-  const session = await getServerSession(authOptions);
+  const auth = await requireAuth();
+  if (isAuthError(auth)) return auth;
 
-  if (!session?.user?.id) {
-    return unauthorizedResponse();
-  }
+  const body = await parseJsonBody(request, productSchema);
+  if (isParseError(body)) return body;
 
-  const body = await request.json();
-  const { url, name, targetPrice } = body;
-
-  // Validate required fields
-  const errors: Record<string, string[]> = {};
-  
-  if (!url || typeof url !== 'string') {
-    errors.url = ['URL is required'];
-  } else if (!isValidUrl(url)) {
-    errors.url = ['Invalid URL format'];
-  }
-
-  if (!name || typeof name !== 'string') {
-    errors.name = ['Product name is required'];
-  }
-
-  if (targetPrice !== undefined && (typeof targetPrice !== 'number' || targetPrice < 0)) {
-    errors.targetPrice = ['Target price must be a positive number'];
-  }
-
-  if (Object.keys(errors).length > 0) {
-    throw new ValidationError('Validation failed', errors);
-  }
-
-  // Check product limit for non-premium users
-  const user = await prisma.user.findUnique({
-    where: { id: session.user.id },
-    select: { isPremium: true },
-  });
-
-  if (!user?.isPremium) {
-    const productCount = await prisma.product.count({
-      where: { userId: session.user.id },
-    });
-
-    if (productCount >= 5) {
-      return badRequestResponse(
-        'Free users can only track up to 5 products. Upgrade to premium for unlimited tracking.'
-      );
-    }
+  // Check subscription limits
+  const limitCheck = await checkSubscriptionLimits(auth.userId, 'products');
+  if (!limitCheck.allowed) {
+    return apiError(limitCheck.message, ApiErrorType.FORBIDDEN);
   }
 
   const product = await prisma.product.create({
     data: {
-      url,
-      name,
-      targetPrice,
-      userId: session.user.id,
+      url: body.url,
+      name: body.name,
+      targetPrice: body.targetPrice,
+      userId: auth.userId,
+    },
+    include: {
+      alerts: true,
     },
   });
 
-  return successResponse(product, 'Product created successfully', 201);
+  return apiSuccess(product, 201);
 });
-
-function isValidUrl(string: string): boolean {
-  try {
-    new URL(string);
-    return true;
-  } catch {
-    return false;
-  }
-}
