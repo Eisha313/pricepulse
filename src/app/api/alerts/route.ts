@@ -1,97 +1,80 @@
 import { NextRequest } from 'next/server';
 import { prisma } from '@/lib/db';
-import { apiSuccess, apiError, ApiErrorType } from '@/lib/apiResponse';
-import { withErrorHandler } from '@/lib/apiErrorHandler';
-import { alertSchema } from '@/lib/validations/alert';
-import {
-  requireAuth,
-  isAuthError,
-  parseJsonBody,
-  isParseError,
-  getPaginationParams,
-  buildPaginationMeta,
-  getSearchParam,
-} from '@/lib/apiHelpers';
-import { checkSubscriptionLimits } from '@/lib/subscription';
+import { apiSuccess, apiError, ApiErrorCode } from '@/lib/apiResponse';
+import { createApiHandler, ApiContext } from '@/lib/apiMiddleware';
+import { alertSchema, AlertInput } from '@/lib/validations/alert';
 
-export const GET = withErrorHandler(async (request: NextRequest) => {
-  const auth = await requireAuth();
-  if (isAuthError(auth)) return auth;
+async function handleGet(req: NextRequest, context: ApiContext) {
+  const userId = context.session!.user.id;
+  const { searchParams } = new URL(req.url);
+  const productId = searchParams.get('productId');
 
-  const pagination = getPaginationParams(request, { limit: 20 });
-  const productId = getSearchParam(request, 'productId');
-  const status = getSearchParam(request, 'status');
+  const whereClause: Record<string, unknown> = {
+    product: { userId },
+  };
 
-  const where: any = { userId: auth.userId };
-  
   if (productId) {
-    where.productId = productId;
-  }
-  
-  if (status === 'active') {
-    where.isActive = true;
-  } else if (status === 'triggered') {
-    where.triggeredAt = { not: null };
+    whereClause.productId = productId;
   }
 
-  const [alerts, total] = await Promise.all([
-    prisma.alert.findMany({
-      where,
-      include: {
-        product: {
-          select: {
-            id: true,
-            name: true,
-            url: true,
-            currentPrice: true,
-          },
+  const alerts = await prisma.alert.findMany({
+    where: whereClause,
+    include: {
+      product: {
+        select: {
+          id: true,
+          name: true,
+          url: true,
+          currentPrice: true,
         },
       },
-      orderBy: { createdAt: 'desc' },
-      skip: pagination.skip,
-      take: pagination.limit,
-    }),
-    prisma.alert.count({ where }),
-  ]);
-
-  return apiSuccess({
-    alerts,
-    pagination: buildPaginationMeta(total, pagination),
-  });
-});
-
-export const POST = withErrorHandler(async (request: NextRequest) => {
-  const auth = await requireAuth();
-  if (isAuthError(auth)) return auth;
-
-  const body = await parseJsonBody(request, alertSchema);
-  if (isParseError(body)) return body;
-
-  // Check subscription limits
-  const limitCheck = await checkSubscriptionLimits(auth.userId, 'alerts');
-  if (!limitCheck.allowed) {
-    return apiError(limitCheck.message, ApiErrorType.FORBIDDEN);
-  }
-
-  // Verify product ownership
-  const product = await prisma.product.findFirst({
-    where: {
-      id: body.productId,
-      userId: auth.userId,
     },
+    orderBy: { createdAt: 'desc' },
+  });
+
+  return apiSuccess(alerts);
+}
+
+async function handlePost(req: NextRequest, context: ApiContext<AlertInput>) {
+  const userId = context.session!.user.id;
+  const { productId, targetPrice, notifyEmail, notifyPush } = context.body!;
+
+  // Verify product belongs to user
+  const product = await prisma.product.findFirst({
+    where: { id: productId, userId },
   });
 
   if (!product) {
-    return apiError('Product not found', ApiErrorType.NOT_FOUND);
+    return apiError(
+      'Product not found',
+      ApiErrorCode.NOT_FOUND,
+      404
+    );
+  }
+
+  // Check for existing alert with same target price
+  const existingAlert = await prisma.alert.findFirst({
+    where: {
+      productId,
+      targetPrice,
+      isActive: true,
+    },
+  });
+
+  if (existingAlert) {
+    return apiError(
+      'An alert with this target price already exists',
+      ApiErrorCode.VALIDATION_ERROR,
+      400
+    );
   }
 
   const alert = await prisma.alert.create({
     data: {
-      productId: body.productId,
-      userId: auth.userId,
-      targetPrice: body.targetPrice,
-      type: body.type || 'PRICE_DROP',
-      isActive: true,
+      productId,
+      targetPrice,
+      notifyEmail: notifyEmail ?? true,
+      notifyPush: notifyPush ?? false,
     },
     include: {
       product: {
@@ -99,10 +82,29 @@ export const POST = withErrorHandler(async (request: NextRequest) => {
           id: true,
           name: true,
           url: true,
+          currentPrice: true,
         },
       },
     },
   });
 
   return apiSuccess(alert, 201);
-});
+}
+
+const handlers = createApiHandler<AlertInput>(
+  {
+    GET: handleGet,
+    POST: handlePost,
+  },
+  {
+    requireAuth: true,
+    checkSubscription: true,
+    bodySchema: alertSchema,
+    rateLimit: {
+      requests: 30,
+      window: 60,
+    },
+  }
+);
+
+export const { GET, POST } = handlers;
