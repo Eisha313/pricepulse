@@ -1,134 +1,165 @@
-import { useState, useEffect, useCallback } from 'react';
+import useSWR from 'swr';
+import { useState, useCallback } from 'react';
 
-export interface Product {
+interface Product {
   id: string;
   url: string;
   name: string;
   currentPrice: number;
-  targetPrice: number;
-  imageUrl?: string;
+  targetPrice: number | null;
+  imageUrl: string | null;
+  currency: string;
   createdAt: string;
   updatedAt: string;
 }
 
-export interface CreateProductInput {
-  url: string;
-  name: string;
-  targetPrice: number;
+interface ProductsResponse {
+  products: Product[];
+  total: number;
 }
 
-export interface UpdateProductInput {
-  name?: string;
-  targetPrice?: number;
+interface UseProductsOptions {
+  page?: number;
+  limit?: number;
+  sortBy?: 'createdAt' | 'currentPrice' | 'name';
+  sortOrder?: 'asc' | 'desc';
 }
 
-export function useProducts() {
-  const [products, setProducts] = useState<Product[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+const fetcher = async (url: string) => {
+  const res = await fetch(url);
+  
+  if (!res.ok) {
+    const error = new Error('Failed to fetch products');
+    const data = await res.json().catch(() => ({}));
+    (error as any).info = data;
+    (error as any).status = res.status;
+    throw error;
+  }
+  
+  return res.json();
+};
 
-  const fetchProducts = useCallback(async () => {
-    try {
-      setLoading(true);
-      setError(null);
-      const response = await fetch('/api/products');
-      
-      if (!response.ok) {
-        throw new Error('Failed to fetch products');
-      }
-      
-      const data = await response.json();
-      setProducts(data);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'An error occurred');
-    } finally {
-      setLoading(false);
+export function useProducts(options: UseProductsOptions = {}) {
+  const { page = 1, limit = 10, sortBy = 'createdAt', sortOrder = 'desc' } = options;
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [submitError, setSubmitError] = useState<string | null>(null);
+  
+  const queryParams = new URLSearchParams({
+    page: page.toString(),
+    limit: limit.toString(),
+    sortBy,
+    sortOrder,
+  });
+
+  const { data, error, isLoading, isValidating, mutate } = useSWR<ProductsResponse>(
+    `/api/products?${queryParams}`,
+    fetcher,
+    {
+      revalidateOnFocus: false,
+      dedupingInterval: 5000,
+      errorRetryCount: 3,
+      errorRetryInterval: 1000,
     }
-  }, []);
+  );
 
-  const addProduct = useCallback(async (input: CreateProductInput) => {
+  const addProduct = useCallback(async (productData: { url: string; targetPrice?: number }) => {
+    setIsSubmitting(true);
+    setSubmitError(null);
+    
     try {
-      setError(null);
-      const response = await fetch('/api/products', {
+      const res = await fetch('/api/products', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(input),
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(productData),
       });
 
-      if (!response.ok) {
-        const errorData = await response.json();
-        throw new Error(errorData.error || 'Failed to add product');
+      const responseData = await res.json();
+
+      if (!res.ok) {
+        throw new Error(responseData.error || 'Failed to add product');
       }
 
-      const newProduct = await response.json();
-      setProducts((prev) => [newProduct, ...prev]);
-      return newProduct;
+      await mutate();
+      return responseData;
     } catch (err) {
-      const message = err instanceof Error ? err.message : 'An error occurred';
-      setError(message);
+      const message = err instanceof Error ? err.message : 'Failed to add product';
+      setSubmitError(message);
       throw err;
+    } finally {
+      setIsSubmitting(false);
     }
-  }, []);
+  }, [mutate]);
 
-  const updateProduct = useCallback(async (id: string, input: UpdateProductInput) => {
+  const updateProduct = useCallback(async (id: string, updates: Partial<Product>) => {
+    setIsSubmitting(true);
+    setSubmitError(null);
+    
     try {
-      setError(null);
-      const response = await fetch(`/api/products/${id}`, {
+      const res = await fetch(`/api/products/${id}`, {
         method: 'PATCH',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(input),
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(updates),
       });
 
-      if (!response.ok) {
-        throw new Error('Failed to update product');
+      const responseData = await res.json();
+
+      if (!res.ok) {
+        throw new Error(responseData.error || 'Failed to update product');
       }
 
-      const updatedProduct = await response.json();
-      setProducts((prev) =>
-        prev.map((p) => (p.id === id ? updatedProduct : p))
-      );
-      return updatedProduct;
+      await mutate();
+      return responseData;
     } catch (err) {
-      const message = err instanceof Error ? err.message : 'An error occurred';
-      setError(message);
+      const message = err instanceof Error ? err.message : 'Failed to update product';
+      setSubmitError(message);
       throw err;
+    } finally {
+      setIsSubmitting(false);
     }
-  }, []);
+  }, [mutate]);
 
   const deleteProduct = useCallback(async (id: string) => {
+    setIsSubmitting(true);
+    setSubmitError(null);
+    
     try {
-      setError(null);
-      const response = await fetch(`/api/products/${id}`, {
+      const res = await fetch(`/api/products/${id}`, {
         method: 'DELETE',
       });
 
-      if (!response.ok) {
-        throw new Error('Failed to delete product');
+      if (!res.ok) {
+        const responseData = await res.json().catch(() => ({}));
+        throw new Error(responseData.error || 'Failed to delete product');
       }
 
-      setProducts((prev) => prev.filter((p) => p.id !== id));
+      await mutate();
     } catch (err) {
-      const message = err instanceof Error ? err.message : 'An error occurred';
-      setError(message);
+      const message = err instanceof Error ? err.message : 'Failed to delete product';
+      setSubmitError(message);
       throw err;
+    } finally {
+      setIsSubmitting(false);
     }
+  }, [mutate]);
+
+  const clearError = useCallback(() => {
+    setSubmitError(null);
   }, []);
 
-  useEffect(() => {
-    fetchProducts();
-  }, [fetchProducts]);
-
   return {
-    products,
-    loading,
-    error,
+    products: data?.products ?? [],
+    total: data?.total ?? 0,
+    isLoading,
+    isValidating,
+    isSubmitting,
+    error: error?.message || null,
+    submitError,
     addProduct,
     updateProduct,
     deleteProduct,
-    refetch: fetchProducts,
+    refresh: mutate,
+    clearError,
   };
 }
+
+export type { Product, ProductsResponse, UseProductsOptions };
