@@ -1,250 +1,282 @@
-import { prisma } from '@/lib/db';
-import { scrapePriceFromUrl } from '@/lib/priceScraper';
-import { sendPriceAlertNotification } from '@/lib/notifications';
-import { ProductRepository } from '@/repositories/productRepository';
-import { AlertRepository } from '@/repositories/alertRepository';
+import { db } from '@/lib/db';
+import { scrapePrice } from '@/lib/priceScraper';
+import { sendPriceDropNotification } from '@/lib/notifications';
+import { formatPrice } from '@/lib/priceUtils';
 
-export interface PriceCheckResult {
+interface PriceCheckResult {
   productId: string;
-  productName: string;
-  previousPrice: number;
-  currentPrice: number;
-  priceChanged: boolean;
-  alertsTriggered: number;
+  success: boolean;
+  oldPrice?: number;
+  newPrice?: number;
   error?: string;
 }
 
-export interface PriceCheckSummary {
-  totalProducts: number;
-  productsChecked: number;
-  pricesChanged: number;
-  alertsTriggered: number;
-  errors: number;
+interface PriceCheckSummary {
+  total: number;
+  successful: number;
+  failed: number;
+  priceDrops: number;
   results: PriceCheckResult[];
-  duration: number;
 }
 
-export class PriceCheckService {
-  private productRepo: ProductRepository;
-  private alertRepo: AlertRepository;
+const BATCH_SIZE = 5;
+const RETRY_ATTEMPTS = 3;
+const RETRY_DELAY_MS = 1000;
+const LOCK_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
 
-  constructor() {
-    this.productRepo = new ProductRepository();
-    this.alertRepo = new AlertRepository();
-  }
+async function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
 
-  async checkAllPrices(): Promise<PriceCheckSummary> {
-    const startTime = Date.now();
-    const results: PriceCheckResult[] = [];
+async function acquireLock(productId: string): Promise<boolean> {
+  const lockKey = `price_check_lock_${productId}`;
+  const now = new Date();
+  const lockExpiry = new Date(now.getTime() + LOCK_TIMEOUT_MS);
 
-    const products = await prisma.product.findMany({
+  try {
+    // Try to acquire lock using atomic update
+    const result = await db.product.updateMany({
       where: {
-        user: {
-          OR: [
-            { subscriptionStatus: 'active' },
-            { subscriptionStatus: null },
-          ],
-        },
+        id: productId,
+        OR: [
+          { lockedUntil: null },
+          { lockedUntil: { lt: now } }
+        ]
       },
-      include: {
-        user: true,
-        alerts: {
-          where: {
-            isActive: true,
-          },
-        },
-      },
-    });
-
-    for (const product of products) {
-      const result = await this.checkProductPrice(product);
-      results.push(result);
-    }
-
-    const summary: PriceCheckSummary = {
-      totalProducts: products.length,
-      productsChecked: results.filter((r) => !r.error).length,
-      pricesChanged: results.filter((r) => r.priceChanged).length,
-      alertsTriggered: results.reduce((sum, r) => sum + r.alertsTriggered, 0),
-      errors: results.filter((r) => r.error).length,
-      results,
-      duration: Date.now() - startTime,
-    };
-
-    await this.logPriceCheckRun(summary);
-
-    return summary;
-  }
-
-  async checkProductPrice(product: any): Promise<PriceCheckResult> {
-    const result: PriceCheckResult = {
-      productId: product.id,
-      productName: product.name,
-      previousPrice: product.currentPrice,
-      currentPrice: product.currentPrice,
-      priceChanged: false,
-      alertsTriggered: 0,
-    };
-
-    try {
-      const scrapedData = await scrapePriceFromUrl(product.url);
-
-      if (!scrapedData.price) {
-        result.error = 'Failed to scrape price';
-        return result;
-      }
-
-      const newPrice = scrapedData.price;
-      result.currentPrice = newPrice;
-      result.priceChanged = newPrice !== product.currentPrice;
-
-      if (result.priceChanged) {
-        await this.updateProductPrice(product.id, newPrice, product.currentPrice);
-      }
-
-      // Check alerts
-      const triggeredAlerts = await this.checkAndTriggerAlerts(
-        product,
-        newPrice
-      );
-      result.alertsTriggered = triggeredAlerts;
-
-      return result;
-    } catch (error) {
-      result.error = error instanceof Error ? error.message : 'Unknown error';
-      return result;
-    }
-  }
-
-  private async updateProductPrice(
-    productId: string,
-    newPrice: number,
-    previousPrice: number
-  ): Promise<void> {
-    await prisma.$transaction([
-      prisma.product.update({
-        where: { id: productId },
-        data: {
-          currentPrice: newPrice,
-          lowestPrice: {
-            set: Math.min(newPrice, previousPrice),
-          },
-          highestPrice: {
-            set: Math.max(newPrice, previousPrice),
-          },
-          lastCheckedAt: new Date(),
-        },
-      }),
-      prisma.priceHistory.create({
-        data: {
-          productId,
-          price: newPrice,
-        },
-      }),
-    ]);
-  }
-
-  private async checkAndTriggerAlerts(
-    product: any,
-    currentPrice: number
-  ): Promise<number> {
-    let triggeredCount = 0;
-
-    for (const alert of product.alerts) {
-      const shouldTrigger = this.shouldTriggerAlert(alert, currentPrice, product.currentPrice);
-
-      if (shouldTrigger) {
-        await this.triggerAlert(alert, product, currentPrice);
-        triggeredCount++;
-      }
-    }
-
-    return triggeredCount;
-  }
-
-  private shouldTriggerAlert(
-    alert: any,
-    currentPrice: number,
-    previousPrice: number
-  ): boolean {
-    switch (alert.type) {
-      case 'PRICE_DROP':
-        return currentPrice < previousPrice;
-      case 'TARGET_PRICE':
-        return currentPrice <= alert.targetPrice;
-      case 'PERCENTAGE_DROP':
-        const percentageDrop = ((previousPrice - currentPrice) / previousPrice) * 100;
-        return percentageDrop >= (alert.percentageThreshold || 10);
-      default:
-        return false;
-    }
-  }
-
-  private async triggerAlert(
-    alert: any,
-    product: any,
-    currentPrice: number
-  ): Promise<void> {
-    await sendPriceAlertNotification({
-      userId: product.userId,
-      productId: product.id,
-      productName: product.name,
-      productUrl: product.url,
-      previousPrice: product.currentPrice,
-      currentPrice,
-      alertType: alert.type,
-      targetPrice: alert.targetPrice,
-    });
-
-    await prisma.alert.update({
-      where: { id: alert.id },
       data: {
-        lastTriggeredAt: new Date(),
-        triggerCount: {
-          increment: 1,
-        },
-      },
+        lockedUntil: lockExpiry
+      }
     });
+
+    return result.count > 0;
+  } catch (error) {
+    console.error(`Failed to acquire lock for product ${productId}:`, error);
+    return false;
+  }
+}
+
+async function releaseLock(productId: string): Promise<void> {
+  try {
+    await db.product.update({
+      where: { id: productId },
+      data: { lockedUntil: null }
+    });
+  } catch (error) {
+    console.error(`Failed to release lock for product ${productId}:`, error);
+  }
+}
+
+async function checkPriceWithRetry(
+  productId: string,
+  url: string,
+  attempts: number = RETRY_ATTEMPTS
+): Promise<{ price: number | null; error?: string }> {
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      const result = await scrapePrice(url);
+      
+      if (result.success && result.price !== null) {
+        return { price: result.price };
+      }
+      
+      if (attempt < attempts) {
+        console.log(`Retry ${attempt}/${attempts} for product ${productId}`);
+        await sleep(RETRY_DELAY_MS * attempt);
+      }
+    } catch (error) {
+      if (attempt < attempts) {
+        console.log(`Error on attempt ${attempt}/${attempts} for product ${productId}:`, error);
+        await sleep(RETRY_DELAY_MS * attempt);
+      } else {
+        return { 
+          price: null, 
+          error: error instanceof Error ? error.message : 'Unknown error' 
+        };
+      }
+    }
+  }
+  
+  return { price: null, error: 'Max retry attempts reached' };
+}
+
+async function checkSingleProduct(productId: string): Promise<PriceCheckResult> {
+  // Try to acquire lock to prevent concurrent checks
+  const lockAcquired = await acquireLock(productId);
+  
+  if (!lockAcquired) {
+    return {
+      productId,
+      success: false,
+      error: 'Could not acquire lock - another check may be in progress'
+    };
   }
 
-  private async logPriceCheckRun(summary: PriceCheckSummary): Promise<void> {
-    console.log('[PriceCheckService] Run completed:', {
-      totalProducts: summary.totalProducts,
-      productsChecked: summary.productsChecked,
-      pricesChanged: summary.pricesChanged,
-      alertsTriggered: summary.alertsTriggered,
-      errors: summary.errors,
-      duration: `${summary.duration}ms`,
-    });
-  }
-
-  async checkSingleProduct(productId: string): Promise<PriceCheckResult> {
-    const product = await prisma.product.findUnique({
+  try {
+    const product = await db.product.findUnique({
       where: { id: productId },
       include: {
-        user: true,
         alerts: {
-          where: {
-            isActive: true,
-          },
-        },
-      },
+          where: { active: true },
+          include: { user: true }
+        }
+      }
     });
 
     if (!product) {
       return {
         productId,
-        productName: 'Unknown',
-        previousPrice: 0,
-        currentPrice: 0,
-        priceChanged: false,
-        alertsTriggered: 0,
-        error: 'Product not found',
+        success: false,
+        error: 'Product not found'
       };
     }
 
-    return this.checkProductPrice(product);
+    const oldPrice = product.currentPrice?.toNumber() ?? null;
+    const { price: newPrice, error } = await checkPriceWithRetry(productId, product.url);
+
+    if (newPrice === null) {
+      // Update failure count for monitoring
+      await db.product.update({
+        where: { id: productId },
+        data: {
+          lastCheckFailed: true,
+          failureCount: { increment: 1 },
+          lastChecked: new Date()
+        }
+      });
+
+      return {
+        productId,
+        success: false,
+        oldPrice: oldPrice ?? undefined,
+        error: error || 'Failed to fetch price'
+      };
+    }
+
+    // Update product with new price - use transaction for consistency
+    await db.$transaction(async (tx) => {
+      await tx.product.update({
+        where: { id: productId },
+        data: {
+          currentPrice: newPrice,
+          lastChecked: new Date(),
+          lastCheckFailed: false,
+          failureCount: 0
+        }
+      });
+
+      await tx.priceHistory.create({
+        data: {
+          productId,
+          price: newPrice
+        }
+      });
+    });
+
+    // Check for price drops and notify users
+    let priceDropped = false;
+    if (oldPrice !== null && newPrice < oldPrice) {
+      priceDropped = true;
+      
+      for (const alert of product.alerts) {
+        if (newPrice <= alert.targetPrice.toNumber()) {
+          try {
+            await sendPriceDropNotification({
+              userEmail: alert.user.email!,
+              productName: product.name,
+              productUrl: product.url,
+              oldPrice: formatPrice(oldPrice),
+              newPrice: formatPrice(newPrice),
+              targetPrice: formatPrice(alert.targetPrice.toNumber())
+            });
+
+            // Mark alert as triggered
+            await db.alert.update({
+              where: { id: alert.id },
+              data: { 
+                lastTriggered: new Date(),
+                triggerCount: { increment: 1 }
+              }
+            });
+          } catch (notificationError) {
+            console.error(`Failed to send notification for alert ${alert.id}:`, notificationError);
+          }
+        }
+      }
+    }
+
+    return {
+      productId,
+      success: true,
+      oldPrice: oldPrice ?? undefined,
+      newPrice
+    };
+  } finally {
+    // Always release the lock
+    await releaseLock(productId);
   }
 }
 
-export const priceCheckService = new PriceCheckService();
+export async function checkAllPrices(): Promise<PriceCheckSummary> {
+  const products = await db.product.findMany({
+    where: {
+      alerts: {
+        some: { active: true }
+      },
+      // Skip products with too many recent failures
+      OR: [
+        { failureCount: { lt: 5 } },
+        { lastChecked: { lt: new Date(Date.now() - 24 * 60 * 60 * 1000) } }
+      ]
+    },
+    select: { id: true }
+  });
+
+  const results: PriceCheckResult[] = [];
+  let priceDrops = 0;
+
+  // Process in batches to avoid overwhelming external services
+  for (let i = 0; i < products.length; i += BATCH_SIZE) {
+    const batch = products.slice(i, i + BATCH_SIZE);
+    
+    const batchResults = await Promise.allSettled(
+      batch.map(product => checkSingleProduct(product.id))
+    );
+
+    for (const result of batchResults) {
+      if (result.status === 'fulfilled') {
+        results.push(result.value);
+        if (result.value.success && 
+            result.value.oldPrice !== undefined && 
+            result.value.newPrice !== undefined &&
+            result.value.newPrice < result.value.oldPrice) {
+          priceDrops++;
+        }
+      } else {
+        results.push({
+          productId: 'unknown',
+          success: false,
+          error: result.reason?.message || 'Unknown error'
+        });
+      }
+    }
+
+    // Small delay between batches
+    if (i + BATCH_SIZE < products.length) {
+      await sleep(500);
+    }
+  }
+
+  return {
+    total: products.length,
+    successful: results.filter(r => r.success).length,
+    failed: results.filter(r => !r.success).length,
+    priceDrops,
+    results
+  };
+}
+
+export async function checkProductPrice(productId: string): Promise<PriceCheckResult> {
+  return checkSingleProduct(productId);
+}
+
+export { type PriceCheckResult, type PriceCheckSummary };

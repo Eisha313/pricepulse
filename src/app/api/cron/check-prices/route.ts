@@ -1,90 +1,68 @@
-import { NextRequest, NextResponse } from 'next/server';
-import { priceCheckService } from '@/services/priceCheckService';
-import { cronConfig, validateCronSecret } from '@/lib/cronConfig';
-import { successResponse, errorResponse } from '@/lib/apiResponse';
+import { NextResponse } from 'next/server';
+import { checkAllPrices } from '@/services/priceCheckService';
+import { cronConfig, verifyCronSecret } from '@/lib/cronConfig';
+import { apiError, apiSuccess } from '@/lib/apiResponse';
 
 export const runtime = 'nodejs';
-export const maxDuration = 300;
+export const maxDuration = 300; // 5 minutes max for Vercel
 
-export async function GET(request: NextRequest) {
+export async function GET(request: Request) {
   try {
-    // Validate cron secret for security
+    // Verify the request is from Vercel Cron or has valid secret
     const authHeader = request.headers.get('authorization');
-    if (!validateCronSecret(authHeader)) {
-      return errorResponse('Unauthorized', 401);
+    const cronSecret = authHeader?.replace('Bearer ', '');
+
+    if (!verifyCronSecret(cronSecret || '')) {
+      console.warn('Unauthorized cron request attempt');
+      return apiError('Unauthorized', 401);
     }
 
-    console.log('[Cron] Starting price check job...');
+    if (!cronConfig.enabled) {
+      return apiSuccess({ message: 'Price checking is disabled' });
+    }
 
-    const summary = await priceCheckService.checkAllPrices();
+    console.log('Starting scheduled price check...');
+    const startTime = Date.now();
 
-    console.log('[Cron] Price check job completed:', {
-      totalProducts: summary.totalProducts,
-      productsChecked: summary.productsChecked,
-      pricesChanged: summary.pricesChanged,
-      alertsTriggered: summary.alertsTriggered,
-      errors: summary.errors,
-      duration: `${summary.duration}ms`,
+    const result = await checkAllPrices();
+
+    const duration = Date.now() - startTime;
+    console.log(`Price check completed in ${duration}ms:`, {
+      total: result.total,
+      successful: result.successful,
+      failed: result.failed,
+      priceDrops: result.priceDrops
     });
 
-    return successResponse({
+    // Log failed checks for debugging
+    const failures = result.results.filter(r => !r.success);
+    if (failures.length > 0) {
+      console.warn('Failed price checks:', failures.map(f => ({
+        productId: f.productId,
+        error: f.error
+      })));
+    }
+
+    return apiSuccess({
       message: 'Price check completed',
+      duration: `${duration}ms`,
       summary: {
-        totalProducts: summary.totalProducts,
-        productsChecked: summary.productsChecked,
-        pricesChanged: summary.pricesChanged,
-        alertsTriggered: summary.alertsTriggered,
-        errors: summary.errors,
-        duration: summary.duration,
-      },
+        total: result.total,
+        successful: result.successful,
+        failed: result.failed,
+        priceDrops: result.priceDrops
+      }
     });
   } catch (error) {
-    console.error('[Cron] Price check job failed:', error);
-    return errorResponse(
+    console.error('Cron price check error:', error);
+    return apiError(
       error instanceof Error ? error.message : 'Price check failed',
       500
     );
   }
 }
 
-export async function POST(request: NextRequest) {
-  // Allow manual triggering with authentication
-  try {
-    const authHeader = request.headers.get('authorization');
-    if (!validateCronSecret(authHeader)) {
-      return errorResponse('Unauthorized', 401);
-    }
-
-    const body = await request.json().catch(() => ({}));
-    const { productId } = body;
-
-    if (productId) {
-      // Check single product
-      const result = await priceCheckService.checkSingleProduct(productId);
-      return successResponse({
-        message: 'Single product price check completed',
-        result,
-      });
-    }
-
-    // Check all products
-    const summary = await priceCheckService.checkAllPrices();
-    return successResponse({
-      message: 'Price check completed',
-      summary: {
-        totalProducts: summary.totalProducts,
-        productsChecked: summary.productsChecked,
-        pricesChanged: summary.pricesChanged,
-        alertsTriggered: summary.alertsTriggered,
-        errors: summary.errors,
-        duration: summary.duration,
-      },
-    });
-  } catch (error) {
-    console.error('[Cron] Manual price check failed:', error);
-    return errorResponse(
-      error instanceof Error ? error.message : 'Price check failed',
-      500
-    );
-  }
+// Allow POST for manual triggers from admin panel
+export async function POST(request: Request) {
+  return GET(request);
 }

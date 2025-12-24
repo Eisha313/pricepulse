@@ -7,6 +7,21 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+model User {
+  id            String    @id @default(cuid())
+  name          String?
+  email         String?   @unique
+  emailVerified DateTime?
+  image         String?
+  accounts      Account[]
+  sessions      Session[]
+  products      Product[]
+  alerts        Alert[]
+  subscription  Subscription?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+}
+
 model Account {
   id                String  @id @default(cuid())
   userId            String
@@ -34,21 +49,6 @@ model Session {
   user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
 }
 
-model User {
-  id            String    @id @default(cuid())
-  name          String?
-  email         String?   @unique
-  emailVerified DateTime?
-  image         String?
-  accounts      Account[]
-  sessions      Session[]
-  products      Product[]
-  isPremium     Boolean   @default(false)
-  stripeCustomerId String?
-  createdAt     DateTime  @default(now())
-  updatedAt     DateTime  @updatedAt
-}
-
 model VerificationToken {
   identifier String
   token      String   @unique
@@ -58,29 +58,68 @@ model VerificationToken {
 }
 
 model Product {
-  id           String       @id @default(cuid())
-  url          String
-  name         String
-  currentPrice Float?
-  targetPrice  Float
-  imageUrl     String?
-  userId       String
-  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
-  priceHistory PriceHistory[]
-  isActive     Boolean      @default(true)
-  lastChecked  DateTime?
-  createdAt    DateTime     @default(now())
-  updatedAt    DateTime     @updatedAt
+  id            String         @id @default(cuid())
+  name          String
+  url           String
+  imageUrl      String?
+  currentPrice  Decimal?       @db.Decimal(10, 2)
+  lowestPrice   Decimal?       @db.Decimal(10, 2)
+  highestPrice  Decimal?       @db.Decimal(10, 2)
+  currency      String         @default("USD")
+  userId        String
+  user          User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  alerts        Alert[]
+  priceHistory  PriceHistory[]
+  lastChecked   DateTime?
+  lastCheckFailed Boolean      @default(false)
+  failureCount  Int            @default(0)
+  lockedUntil   DateTime?
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
 
   @@index([userId])
+  @@index([lastChecked])
+  @@index([lockedUntil])
+}
+
+model Alert {
+  id            String    @id @default(cuid())
+  targetPrice   Decimal   @db.Decimal(10, 2)
+  active        Boolean   @default(true)
+  productId     String
+  product       Product   @relation(fields: [productId], references: [id], onDelete: Cascade)
+  userId        String
+  user          User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  lastTriggered DateTime?
+  triggerCount  Int       @default(0)
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  @@index([productId])
+  @@index([userId])
+  @@index([active])
 }
 
 model PriceHistory {
   id        String   @id @default(cuid())
+  price     Decimal  @db.Decimal(10, 2)
   productId String
   product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
-  price     Float
-  checkedAt DateTime @default(now())
+  createdAt DateTime @default(now())
 
   @@index([productId])
+  @@index([createdAt])
+}
+
+model Subscription {
+  id                   String   @id @default(cuid())
+  userId               String   @unique
+  user                 User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  stripeCustomerId     String?  @unique
+  stripeSubscriptionId String?  @unique
+  stripePriceId        String?
+  stripeCurrentPeriodEnd DateTime?
+  status               String   @default("inactive")
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
 }
