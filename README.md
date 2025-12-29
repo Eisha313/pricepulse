@@ -4,4 +4,4 @@ A simple price drop alert tool that notifies users when tracked products go on s
 
 ## Updates
 
-Commit 31
+Commit 35
